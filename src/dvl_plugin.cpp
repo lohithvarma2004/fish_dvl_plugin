@@ -1,5 +1,3 @@
-// File: fish_dvl_plugin/src/dvl_plugin.cpp
-
 #include <gazebo/gazebo.hh>
 #include <gazebo/sensors/Sensor.hh>
 #include <gazebo/sensors/RaySensor.hh>
@@ -7,43 +5,46 @@
 #include <gazebo/physics/PhysicsIface.hh>
 
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float64.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
+
+#include <Eigen/Dense>
+#include <array>
 
 namespace gazebo {
 
   class CustomDVLPlugin : public SensorPlugin
   {
   public:
-    CustomDVLPlugin() : SensorPlugin(), previous_range_(0.0) {}
+    CustomDVLPlugin() : SensorPlugin() {}
     virtual ~CustomDVLPlugin() {}
 
     /// \brief Load the sensor plugin.
-    /// \param _sensor Pointer to the sensor that loaded this plugin.
-    /// \param _sdf SDF element containing plugin parameters.
     virtual void Load(sensors::SensorPtr _sensor, sdf::ElementPtr _sdf) override
     {
-      // Ensure ROS is running
-      if (!rclcpp::ok())
-      {
+      // Initialize ROS
+      if (!rclcpp::ok()) {
         rclcpp::init(0, nullptr);
       }
-      // Create a ROS 2 node
       node_ = rclcpp::Node::make_shared("custom_dvl_plugin");
-      publisher_ = node_->create_publisher<std_msgs::msg::Float64>("dvl/velocity", 10);
+      publisher_ = node_->create_publisher<geometry_msgs::msg::Vector3>("dvl/velocity", 10);
 
-      // Cast sensor pointer to RaySensor (we assume our sensor element is of type "ray")
+      // Cast to RaySensor
       this->raySensor_ = std::dynamic_pointer_cast<sensors::RaySensor>(_sensor);
-      if (!this->raySensor_)
-      {
+      if (!this->raySensor_) {
         gzerr << "CustomDVLPlugin requires a RaySensor.\n";
         return;
       }
 
-      // Store the initial update time and initial range reading
-      last_update_time_ = this->raySensor_->LastUpdateTime();
-      previous_range_ = this->raySensor_->Range(0);
+      // Initialize beam indices and previous ranges
+      beamIndices_ = {0, 1, 2, 3};
+      for (size_t i = 0; i < beamIndices_.size(); ++i) {
+        previousRanges_[i] = this->raySensor_->Range(beamIndices_[i]);
+      }
 
-      // Connect the update event
+      // Store initial update time
+      last_update_time_ = this->raySensor_->LastUpdateTime();
+
+      // Connect update event
       updateConnection_ = event::Events::ConnectWorldUpdateBegin(
           std::bind(&CustomDVLPlugin::OnUpdate, this));
     }
@@ -51,28 +52,40 @@ namespace gazebo {
     /// \brief Called on every simulation update.
     void OnUpdate()
     {
-      // Get current time and compute elapsed time
+      // Calculate time difference
       common::Time current_time = this->raySensor_->LastUpdateTime();
       double dt = (current_time - last_update_time_).Double();
-      if (dt <= 0.0)
-      {
-        return;
-      }
+      if (dt <= 0.0) return;
       last_update_time_ = current_time;
 
-      // For demonstration, use the first ray sensor's reading
-      double current_range = this->raySensor_->Range(0);
+      // Calculate range rates for each beam
+      Eigen::Vector4d d;
+      for (size_t i = 0; i < beamIndices_.size(); ++i) {
+        double currentRange = this->raySensor_->Range(beamIndices_[i]);
+        double rangeRate = (previousRanges_[i] - currentRange) / dt; // Negative of (current - prev)/dt
+        d(i) = rangeRate;
+        previousRanges_[i] = currentRange;
+      }
 
-      // Compute a simple velocity estimate (difference in range over time)
-      double velocity = (previous_range_ - current_range) / dt;
-      previous_range_ = current_range;
+      // Define beam directions (20° from vertical, pointing downward)
+      const double alpha = 0.3491; // 20° in radians
+      Eigen::Matrix<double, 4, 3> N;
+      N.row(0) = Eigen::Vector3d(  std::sin(alpha),  0, std::cos(alpha) ); // +X beam
+      N.row(1) = Eigen::Vector3d(  0,  std::sin(alpha), std::cos(alpha) ); // +Y beam
+      N.row(2) = Eigen::Vector3d( -std::sin(alpha),  0, std::cos(alpha) ); // -X beam
+      N.row(3) = Eigen::Vector3d(  0, -std::sin(alpha), std::cos(alpha) ); // -Y beam
 
-      // Publish the velocity
-      std_msgs::msg::Float64 msg;
-      msg.data = velocity;
+      // Solve N * v = -d for velocity v
+      Eigen::Vector3d velocity = -(N.transpose() * N).inverse() * N.transpose() * d;
+
+      // Publish velocity
+      geometry_msgs::msg::Vector3 msg;
+      msg.x = velocity.x();
+      msg.y = velocity.y();
+      msg.z = velocity.z();
       publisher_->publish(msg);
 
-      // Process ROS callbacks (non-blocking)
+      // Process ROS callbacks
       rclcpp::spin_some(node_);
     }
 
@@ -80,13 +93,11 @@ namespace gazebo {
     sensors::RaySensorPtr raySensor_;
     event::ConnectionPtr updateConnection_;
     common::Time last_update_time_;
-    double previous_range_;
-
-    // ROS 2 components
+    std::array<double, 4> previousRanges_;
+    std::array<int, 4> beamIndices_;
     rclcpp::Node::SharedPtr node_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr publisher_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr publisher_;
   };
 
-  // Register this plugin with Gazebo
   GZ_REGISTER_SENSOR_PLUGIN(CustomDVLPlugin)
 }
